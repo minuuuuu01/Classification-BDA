@@ -4,7 +4,7 @@ import numpy as np
 # =========================
 # 0) 데이터 로드
 # =========================
-df = pd.read_csv("train.csv", encoding="utf-8-sig")
+df = pd.read_csv(r"..\datasets\train.csv", encoding="utf-8-sig")
 
 # =========================
 # 1) 50% 이상 결측치 피처 제거 (major1_2는 유지)
@@ -27,9 +27,18 @@ print(f"50% 이상 결측 제거 후 shape: {df_clean.shape}")
 # 1.5) 추가 피처 제거: nationality, ID, generation
 # =========================
 extra_drop_cols = ["nationality", "ID", "generation"]
-df_clean = df_clean.drop(columns=extra_drop_cols, errors="ignore")  # 없으면 무시 [web:208]
+df_clean = df_clean.drop(columns=extra_drop_cols, errors="ignore")  # 없으면 무시
 print(f"추가 제거 컬럼: {extra_drop_cols}")
 print(f"추가 제거 후 shape: {df_clean.shape}")
+
+# =========================
+# 1.6) school1, class1: 정수 -> 문자(범주형 취급)
+# =========================
+# (인코딩은 나중 단계에서 진행. 지금은 '코드/라벨'임을 명확히 하기 위한 변환)
+for col in ["school1", "class1"]:
+    if col in df_clean.columns:
+        df_clean[col] = df_clean[col].astype(str)  # 정수형 코드를 문자열로 변환 [web:437]
+print("school1/class1 dtype -> str 변환 완료")
 
 # =========================
 # 2) completed_semester 이상치/결측 처리 + 정수 변환
@@ -44,12 +53,11 @@ print(f"completed_semester 이상치 개수: {outlier_mask.sum()}개")
 df_clean.loc[outlier_mask, "completed_semester"] = np.nan
 
 # 2-2) 결측(기존 결측 + 이상치 치환분) -> 중앙값으로 대체
-median_semester = df_clean["completed_semester"].median()  # NaN 자동 제외 [web:337]
+median_semester = df_clean["completed_semester"].median()  # NaN 자동 제외
 df_clean["completed_semester"] = df_clean["completed_semester"].fillna(median_semester)
 print(f"completed_semester 결측/이상치 -> 중앙값 {median_semester}로 대체 완료")
 
 # 2-3) 정수형으로 변환
-# - 결측을 이미 채웠으므로 일반 int 캐스팅 가능
 df_clean["completed_semester"] = df_clean["completed_semester"].round().astype(int)
 print(f"completed_semester dtype 변환 완료: {df_clean['completed_semester'].dtype}")
 
@@ -98,7 +106,3 @@ left_na = df_clean.isnull().sum()
 print(left_na[left_na > 0].sort_values(ascending=False))
 
 print(f"\n최종 shape: {df_clean.shape}")
-
-
-
-
