@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 
+
 # =========================
 # 유틸: 결측치 요약(원하면 상위 n개만)
 # =========================
@@ -10,12 +11,14 @@ def na_summary(df: pd.DataFrame, top_n: int = 10):
     na = na[na > 0].sort_values(ascending=False)
     return len(na), (na.head(top_n) if len(na) > 0 else na)
 
+
 def print_one_line(tag: str, shape_in, shape_out, drop50_cnt: int, extra_removed, converted, na_cols_cnt: int):
     print(
         f"[{tag}] shape {shape_in} -> {shape_out} | "
         f"drop50%={drop50_cnt} | extra_drop={len(extra_removed)} | "
         f"to_str={converted} | na_cols={na_cols_cnt}"
     )
+
 
 # =========================
 # 0) 전처리 파라미터 fit (train split에서만)
@@ -37,6 +40,7 @@ def fit_preprocess_params(train_df: pd.DataFrame, threshold: float = 0.5):
     median_semester = tmp["completed_semester"].median()
 
     return cols_to_drop, median_semester
+
 
 # =========================
 # 1) 전처리 transform (train/valid/test 공통 적용)
@@ -83,6 +87,33 @@ def transform_preprocess(df: pd.DataFrame, cols_to_drop, median_semester: float,
         "단일 전공"
     )
 
+    # =========================
+    # (6) 이진 범주형 레이블 인코딩 (0/1)
+    # =========================
+    # major type: 단일=0, 복수=1
+    if "major type" in df_clean.columns:
+        major_type_map = {
+            "단일 전공": 0,
+            "복수 전공 ( 다중전공, 이중전공 포함 )": 1
+        }
+        df_clean["major type"] = df_clean["major type"].map(major_type_map).astype(int)
+
+    # re_registration: 아니요=0, 예=1
+    if "re_registration" in df_clean.columns:
+        re_reg_map = {"아니요": 0, "예": 1}
+        df_clean["re_registration"] = df_clean["re_registration"].map(re_reg_map).astype(int)
+
+    # project_type: 개인=0, 팀=1
+    if "project_type" in df_clean.columns:
+        project_type_map = {"개인": 0, "팀": 1}
+        df_clean["project_type"] = df_clean["project_type"].map(project_type_map).astype(int)
+
+    # major_data: False=0, True=1 (bool/string 섞여도 안전하게)
+    if "major_data" in df_clean.columns:
+        s = df_clean["major_data"].astype(str).str.strip().str.upper()
+        major_data_map = {"FALSE": 0, "TRUE": 1}
+        df_clean["major_data"] = s.map(major_data_map).astype(int)
+
     # 핵심 요약 1줄 출력
     na_cols_cnt, na_top = na_summary(df_clean, top_n=10)
     print_one_line(
@@ -100,6 +131,7 @@ def transform_preprocess(df: pd.DataFrame, cols_to_drop, median_semester: float,
         print(na_top.to_string())
 
     return df_clean
+
 
 # =========================
 # 2) 실행: train/valid split -> fit -> transform
@@ -127,7 +159,7 @@ print(f"[FIT] drop50% cols={len(cols_to_drop)}")
 # (C) 동일 transform 적용 (결측 상위 출력은 TRAIN_SPLIT에서만)
 train_clean = transform_preprocess(train_part, cols_to_drop, median_semester, tag="TRAIN_SPLIT", show_na_top=True)
 valid_clean = transform_preprocess(valid_part, cols_to_drop, median_semester, tag="VALID_SPLIT", show_na_top=False)
-test_clean  = transform_preprocess(test_df,     cols_to_drop, median_semester, tag="TEST",        show_na_top=False)
+test_clean  = transform_preprocess(test_df,      cols_to_drop, median_semester, tag="TEST",        show_na_top=False)
 
 # (D) X/y 분리 + 컬럼 정렬(인코딩 전 단계)
 y_train = train_clean["completed"]
