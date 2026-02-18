@@ -1,0 +1,188 @@
+# =========================================================
+# CatBoost 단일 모델 (Optuna CPU) - F1 + 분포 페널티 + 5-fold + Submit 저장
+# =========================================================
+
+import os
+import datetime
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score
+
+import optuna
+from catboost import CatBoostClassifier
+
+RANDOM_STATE = 42
+N_SPLITS = 5
+
+# -----------------------------
+# 0) df_all -> train/test 분리
+# -----------------------------
+train_idx = df_all[df_all["dataset"] == "train"].index
+test_idx  = df_all[df_all["dataset"] == "test"].index
+
+y = df_all.loc[train_idx, "completed"].astype(int)
+
+X_all = df_all.drop(columns=["completed"])
+X_train = X_all.loc[train_idx].drop(columns=["dataset"]).copy()
+X_test  = X_all.loc[test_idx].drop(columns=["dataset"]).copy()
+
+# -----------------------------
+# 1) CatBoost 범주형 지정 (object 그대로)
+# -----------------------------
+cat_cols = X_train.select_dtypes(include=["object"]).columns.tolist()
+for c in cat_cols:
+    X_train[c] = X_train[c].fillna("Unknown").astype(str)
+    X_test[c]  = X_test[c].fillna("Unknown").astype(str)
+
+cat_feature_indices = [X_train.columns.get_loc(c) for c in cat_cols]
+
+# -----------------------------
+# 2) 분포 출력(필수)
+# -----------------------------
+pos_rate = float(y.mean())
+neg = int((y == 0).sum())
+pos = int((y == 1).sum())
+print("[Train label distribution]")
+print(pd.DataFrame({"count": y.value_counts().sort_index(),
+                    "ratio": (y.value_counts().sort_index()/len(y)).round(6)}))
+print(f"\n[Imbalance] neg={neg}, pos={pos}, neg/pos={neg/max(pos,1):.6f}")
+
+skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+
+# -----------------------------
+# 유틸: threshold 탐색(분포 페널티 포함)
+# -----------------------------
+def best_threshold_with_penalty(y_true, prob, base_pos_rate, penalty_lambda=0.6):
+    # 너무 조밀하게 하면 느려서 0.01 그리드
+    thresholds = np.arange(0.05, 0.96, 0.01)
+    best = {"score": -1e9, "f1": -1, "th": 0.5, "pred_pos_rate": None}
+
+    for th in thresholds:
+        pred = (prob >= th).astype(int)
+        f1 = f1_score(y_true, pred)
+        pred_pos_rate = pred.mean()
+
+        # “F1은 높지만 양성비율이 말이 안 되게 튄” 해를 억제
+        score = f1 - penalty_lambda * abs(pred_pos_rate - base_pos_rate)
+
+        if score > best["score"]:
+            best = {"score": float(score), "f1": float(f1), "th": float(th), "pred_pos_rate": float(pred_pos_rate)}
+    return best
+
+# -----------------------------
+# CV 예측
+# -----------------------------
+def cv_oof_and_test(params, iterations=8000, od_wait=300):
+    oof = np.zeros(len(y), dtype=float)
+    test_pred = np.zeros(len(X_test), dtype=float)
+
+    for fold, (tr, va) in enumerate(skf.split(X_train, y), 1):
+        X_tr, X_va = X_train.iloc[tr], X_train.iloc[va]
+        y_tr, y_va = y.iloc[tr], y.iloc[va]
+
+        model = CatBoostClassifier(
+            iterations=iterations,
+            loss_function="Logloss",
+            eval_metric="Logloss",  # early stopping 안정성 때문에 Logloss 사용
+            random_seed=RANDOM_STATE,
+            task_type="CPU",
+            verbose=False,
+            od_type="Iter",
+            od_wait=od_wait,
+            allow_writing_files=False,
+            **params
+        )
+
+        model.fit(
+            X_tr, y_tr,
+            cat_features=cat_feature_indices,
+            eval_set=(X_va, y_va),
+            use_best_model=True
+        )
+
+        oof[va] = model.predict_proba(X_va)[:, 1]
+        test_pred += model.predict_proba(X_test)[:, 1] / N_SPLITS
+
+    return oof, test_pred
+
+# -----------------------------
+# 3) Optuna: F1(분포 페널티 포함) 최적화
+# -----------------------------
+def objective(trial):
+    params = {
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+        "depth": trial.suggest_int("depth", 4, 10),
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 30.0, log=True),
+        "random_strength": trial.suggest_float("random_strength", 0.0, 2.0),
+        "border_count": trial.suggest_int("border_count", 32, 255),
+
+        # 과적합/분산 줄이기용 feature sampling
+        "rsm": trial.suggest_float("rsm", 0.6, 1.0),
+
+        # 불균형 처리: 약한 불균형(neg/pos≈2.35)이므로
+        # Balanced가 과하게 밀 수 있어 SqrtBalanced도 같이 후보로 둠
+        "auto_class_weights": trial.suggest_categorical(
+            "auto_class_weights", [None, "SqrtBalanced", "Balanced"]
+        ),
+    }
+
+    # bootstrap은 Bayesian/ Bernoulli 둘 중 하나만 (파라미터 충돌 방지)
+    bootstrap_type = trial.suggest_categorical("bootstrap_type", ["Bayesian", "Bernoulli"])
+    params["bootstrap_type"] = bootstrap_type
+    if bootstrap_type == "Bayesian":
+        params["bagging_temperature"] = trial.suggest_float("bagging_temperature", 0.0, 1.0)
+    else:
+        params["subsample"] = trial.suggest_float("subsample", 0.6, 1.0)
+
+    oof, _ = cv_oof_and_test(params, iterations=6000, od_wait=250)
+
+    # Optuna 목적: OOF에서 “F1 최대 + 분포 페널티”로 threshold까지 같이 결정
+    bt = best_threshold_with_penalty(y, oof, pos_rate, penalty_lambda=0.6)
+    return bt["score"]
+
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=50)
+
+best_params = study.best_params.copy()
+print("\n[Best CatBoost params]")
+print(best_params)
+
+# -----------------------------
+# 4) Best params로 최종 OOF/Test 예측 + 최종 threshold 선택
+# -----------------------------
+oof_prob, test_prob = cv_oof_and_test(best_params, iterations=8000, od_wait=300)
+best_th = best_threshold_with_penalty(y, oof_prob, pos_rate, penalty_lambda=0.6)
+
+print("\n[Best threshold by OOF (F1 - penalty)]")
+print({"f1": round(best_th["f1"], 6), "th": best_th["th"],
+       "oof_pred_pos_rate": round(best_th["pred_pos_rate"], 6),
+       "train_pos_rate": round(pos_rate, 6)})
+
+oof_pred = (oof_prob >= best_th["th"]).astype(int)
+test_pred = (test_prob >= best_th["th"]).astype(int)
+
+print("\n[OOF label distribution]")
+print(pd.Series(oof_pred).value_counts().sort_index())
+
+print("\n[Test label distribution]")
+print(pd.Series(test_pred).value_counts().sort_index())
+
+# -----------------------------
+# 5) 제출 저장
+# -----------------------------
+submit_dir = r"..\submit"
+os.makedirs(submit_dir, exist_ok=True)
+
+sample_path = r"..\datasets\sample_submission.csv"
+sub = pd.read_csv(sample_path)[["ID"]].copy()
+sub["completed"] = test_pred.astype(int)
+
+mmdd = datetime.datetime.now().strftime("%m%d")
+fname = f"hmw{mmdd}_{best_th['f1']:.3f}.csv"
+save_path = os.path.join(submit_dir, fname)
+sub.to_csv(save_path, index=False)
+
+print("\n[Saved submission]")
+print(save_path)
